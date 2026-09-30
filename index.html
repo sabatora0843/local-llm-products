@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ローカルLLM作品集</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d1117; color: #e6edf3;
+    font-family: 'Segoe UI', 'Hiragino Kaku Gothic ProN', sans-serif;
+    line-height: 1.7;
+  }
+  main { max-width: 720px; margin: 0 auto; padding: 32px 16px; }
+  h1 { font-size: 26px; margin-bottom: 8px; }
+  .lead { color: #8b949e; margin-bottom: 24px; }
+  #list { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+  .card {
+    display: block; padding: 16px;
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    color: inherit; text-decoration: none;
+  }
+  .card:hover, .card:focus-visible { border-color: #2ea043; }
+  .card h2 { font-size: 18px; margin-bottom: 4px; }
+  .card p { color: #8b949e; font-size: 14px; }
+  .card .ctrl, .card .author { margin-top: 8px; font-size: 12px; color: #6e7681; }
+  .card .ctrl + .author { margin-top: 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ローカルLLM作品集</h1>
+  <p class="lead">ローカルLLMで作成したブラウザゲームの一覧です。</p>
+  <div id="list"></div>
+</main>
+<script>
+// ゲームを追加する場合は、GAMES に1件追加する。
+// { title: 表示名, url: HTMLファイルへの相対パス, desc: 説明, controls: 操作方法(省略可), author: 作成者(省略可) }
+var GAMES = [
+  {
+    title: 'ブロック崩し',
+    url: 'breakout.html',
+    desc: 'パドルでボールを打ち返してブロックを壊すゲーム。レベル制、ライフ3。',
+    controls: 'マウス / タッチ / 矢印キー',
+    author: 'qwen/qwen3.8-27b'
+  },
+  {
+    title: 'インベーダーゲーム',
+    url: 'invaders.html',
+    desc: '自機を動かして攻めてくるインベーダーを撃ち落とすシューティング。レベル制、ライフ3、シールド付き。',
+    controls: '← → で移動 / スペースで射撃 / Pでポーズ',
+    author: 'qwen/qwen3.8-27b'
+  }
+];
+
+(function () {
+  'use strict';
+  var list = document.getElementById('list');
+  GAMES.forEach(function (g) {
+    var a = document.createElement('a');
+    a.className = 'card';
+    a.href = g.url;
+    var h = document.createElement('h2');
+    h.textContent = g.title;
+    var p = document.createElement('p');
+    p.textContent = g.desc;
+    a.appendChild(h);
+    a.appendChild(p);
+    if (g.controls) {
+      var c = document.createElement('p');
+      c.className = 'ctrl';
+      c.textContent = '操作: ' + g.controls;
+      a.appendChild(c);
+    }
+    if (g.author) {
+      var u = document.createElement('p');
+      u.className = 'author';
+      u.textContent = '作成者: ' + g.author;
+      a.appendChild(u);
+    }
+    list.appendChild(a);
+  });
+})();
+</script>
+</body>
+</html>

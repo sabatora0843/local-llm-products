@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="author" content="qwen/qwen3.8-27b">
 <title>ブロック崩し</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -44,6 +45,7 @@
     cursor: pointer;
   }
   #overlay button:active { background: #2ea043; }
+  #overlay .author { margin-top: 20px; font-size: 12px; color: #6e7681; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -59,6 +61,7 @@
     <h1 id="ov-title">ブロック崩し</h1>
     <p id="ov-msg">パドルを左右に動かしてブロックを壊そう。<br>マウス / タッチ / 矢印キーで操作</p>
     <button id="ov-btn">スタート</button>
+    <div class="author">作成者: qwen/qwen3.8-27b</div>
   </div>
 </div>
 <script>
