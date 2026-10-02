@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AIR RAID - three.js</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+  #hud {
+    position: absolute; top: 0; left: 0; width: 100%;
+    padding: 12px 20px; color: #f0e68c; font-family: "Courier New", monospace;
+    font-size: 18px; font-weight: bold;
+    display: flex; justify-content: space-between; align-items: center;
+    text-shadow: 0 0 6px #ff0, 2px 2px 0 #000;
+    pointer-events: none; z-index: 10;
+  }
+  #msg {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: #fff; font-family: "Courier New", monospace; font-size: 22px; font-weight: bold;
+    text-align: center; z-index: 10; pointer-events: none;
+    text-shadow: 0 0 10px #08f, 2px 2px 0 #000;
+    white-space: pre-line; line-height: 1.6;
+  }
+  #vig {
+    position: absolute; inset: 0; pointer-events: none; z-index: 5;
+    background: radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,0.5) 100%);
+  }
+  #scan {
+    position: absolute; inset: 0; pointer-events: none; z-index: 6;
+    background: repeating-linear-gradient(0deg, transparent 0 2px, rgba(0,0,0,0.15) 2px 4px);
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <span id="score">1UP&nbsp; 00000</span>
+  <span id="hi">HIGH 00000</span>
+  <span id="lives">BOMB 3</span>
+</div>
+<div id="vig"></div>
+<div id="scan"></div>
+<div id="msg"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ============ 基本設定 ============
+const GROUND_Y = 0, AIR_Y = 9;
+const PLAYER_SPEED = 10;
+const SWITCH_SPEED = 26;        // レーン変更速度(ゼビウスは高速)
+const GROUND_FIRE_CD = 0.13;
+const BULLET_SPEED = 26;
+const MISSILE_SPEED = 16;
+const MISSILE_TURN = 4.5;
+const MAX_MIS = 3;
+const PLAYER_Z = 11;
+const KILL_Z = -32;             // 画面奥端
+const FRONT_Z = 14;             // 手前到達(自機通過)
+
+// ============ three.js セットアップ ============
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x02020a);
+scene.fog = new THREE.Fog(0x02020a, 10, 38);
+
+const camera = new THREE.PerspectiveCamera(50, 16 / 10, 0.1, 100);
+camera.position.set(0, 6.5, 15);
+camera.lookAt(0, 3.5, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+function fit() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+window.addEventListener('resize', fit);
+fit();
+
+// ============ ライティング ============
+scene.add(new THREE.AmbientLight(0x303048, 1.4));
+const dir = new THREE.DirectionalLight(0x99bbff, 1.0);
+dir.position.set(4, 10, 6);
+scene.add(dir);
+const glow = new THREE.PointLight(0x2288ff, 2.0, 50);
+glow.position.set(0, 10, -2);
+scene.add(glow);
+
+// ============ 星空 ============
+{
+  const n = 500, pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    pos[i*3]   = (Math.random() - 0.5) * 70;
+    pos[i*3+1] = Math.random() * 35 + 4;
+    pos[i*3+2] = -25 - Math.random() * 35;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0x99bbff, size: 0.14 })));
+}
+
+// ============ 地上(スクロール床) ============
+const grid = new THREE.GridHelper(44, 44, 0x2255aa, 0x0a2a44);
+grid.position.y = 0;
+scene.add(grid);
+{
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(44, 64),
+    new THREE.MeshLambertMaterial({ color: 0x05070f })
+  );
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.y = -0.02;
+  scene.add(floor);
+}
+// 空中レーンの光帯
+const airBand = new THREE.Mesh(
+  new THREE.PlaneGeometry(44, 3.4),
+  new THREE.MeshBasicMaterial({ color: 0x00ffff, transparent: true, opacity: 0.05, side: THREE.DoubleSide })
+);
+airBand.rotation.x = -Math.PI / 2;
+airBand.position.y = AIR_Y + 2.6;
+scene.add(airBand);
+
+// ============ メッシュ生成ヘルパー ============
+function mat(c, em) { return new THREE.MeshLambertMaterial({ color: c, emissive: em }); }
+
+function makePlayerMesh() {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.9, 1.8), mat(0x33aaff, 0x113355));
+  body.position.y = 0.8;
+  g.add(body);
+  const cockpit = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.7, 1.1), mat(0x88ddff, 0x224466));
+  cockpit.position.y = 1.5;
+  g.add(cockpit);
+  const wL = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.35, 1.4), mat(0x00ccff, 0x004455));
+  wL.position.set(-1.35, 0.8, 0.1);
+  g.add(wL);
+  const wR = wL.clone(); wR.position.x = 1.35;
+  g.add(wR);
+  const gun = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 1.4), mat(0xffcc33, 0x553300));
+  gun.rotation.x = Math.PI / 2;
+  gun.position.set(0, 1.5, -1.4);
+  g.add(gun);
+  // ミサイルポッド
+  const podL = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 1.0), mat(0xff8844, 0x442200));
+  podL.position.set(-1.0, 1.4, -0.4);
+  g.add(podL);
+  const podR = podL.clone(); podR.position.x = 1.0;
+  g.add(podR);
+  return g;
+}
+
+function makeEnemyMesh(kind) {
+  // kind: 'g1','g2','a1','a2' (g=地上, a=空中)
+  const g = new THREE.Group();
+  let c, em;
+  if (kind === 'g1')      { c = 0xff4455; em = 0x551122; }
+  else if (kind === 'g2') { c = 0xffaa22; em = 0x553300; }
+  else if (kind === 'a1') { c = 0xbb66ff; em = 0x331155; }
+  else                    { c = 0x44ddaa; em = 0x114433; }
+
+  if (kind[0] === 'g') {
+    // 地上兵: 車体風
+    const body = new THREE.Mesh(new THREE.BoxGeometry(2.0, 1.0, 2.4), mat(c, em));
+    body.position.y = 0.8;
+    g.add(body);
+    const turret = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.6, 0.8), mat(0xcccccc, 0x333333));
+    turret.position.y = 1.6;
+    g.add(turret);
+    const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.12, 1.4), mat(0xaaaaaa, 0x222222));
+    barrel.rotation.x = Math.PI / 2;
+    barrel.position.set(0, 1.7, -1.3);
+    g.add(barrel);
+    const track = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.5, 2.6), mat(0x222222, 0x000000));
+    track.position.y = 0.2;
+    g.add(track);
+  } else {
+    // 空中兵: 飛行機風
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.8, 2.6), mat(c, em));
+    g.add(body);
+    const nose = new THREE.Mesh(new THREE.ConeGeometry(0.4, 1.0, 8), mat(c, em));
+    nose.rotation.x = -Math.PI / 2;
+    nose.position.z = -1.8;
+    g.add(nose);
+    const wing = new THREE.Mesh(new THREE.BoxGeometry(3.4, 0.15, 1.0), mat(c, em));
+    wing.position.z = 0.2;
+    g.add(wing);
+    const tail = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.15, 0.6), mat(c, em));
+    tail.position.set(0, 0.5, 1.1);
+    g.add(tail);
+    const prop = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.1, 0.15), mat(0xffffff, 0x555555));
+    prop.position.z = -2.2;
+    g.add(prop);
+    g.userData.prop = prop;
+  }
+  return g;
+}
+
+function makeBulletMesh(color) {
+  return new THREE.Mesh(new THREE.SphereGeometry(0.32, 10, 10),
+    new THREE.MeshBasicMaterial({ color }));
+}
+
+function makeMissileMesh() {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.3, 1.5), mat(0xff8833, 0x663300));
+  g.add(body);
+  const tip = new THREE.Mesh(new THREE.ConeGeometry(0.22, 0.5), mat(0xffcc44, 0x884400));
+  tip.position.y = 1.0;
+  g.add(tip);
+  const finL = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.1, 0.3), mat(0xff8833, 0x663300));
+  finL.position.set(0.3, -0.5, 0);
+  g.add(finL);
+  const finR = finL.clone(); finR.position.x = -0.3;
+  g.add(finR);
+  return g;
+}
+
+function makeExplosion(big) {
+  const g = new THREE.Group();
+  const n = big ? 14 : 8;
+  for (let i = 0; i < n; i++) {
+    const s = new THREE.Mesh(
+      new THREE.BoxGeometry(big ? 0.4 : 0.25, big ? 0.4 : 0.25, big ? 0.4 : 0.25),
+      new THREE.MeshBasicMaterial({ color: [0xffaa00, 0xff4400, 0xffff66][i % 3] })
+    );
+    s.userData.vel = new THREE.Vector3(
+      (Math.random() - 0.5) * (big ? 10 : 7),
+      (Math.random() - 0.5) * (big ? 10 : 7),
+      (Math.random() - 0.5) * (big ? 10 : 7)
+    );
+    g.add(s);
+  }
+  return g;
+}
+
+// ============ 状態 ============
+const player = {
+  mesh: makePlayerMesh(),
+  x: 0,
+  lane: 0,              // 0=地上, 1=空中
+  y: GROUND_Y,
+  alive: true,
+  respawnT: 0,
+  invuln: 0,
+  switching: false,     // レーン変更中(ゼビウス: 被弾しない)
+  fireCd: 0,
+  misCount: 0
+};
+scene.add(player.mesh);
+
+let bullets = [], missiles = [], enemies = [], explosions = [], enemyBullets = [];
+let score = 0, hi = 0, lives = 3, wave = 0;
+let state = 'title';
+let wavePause = 0;
+let bgScroll = 0;
+
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+const hudScore = document.getElementById('score');
+const hudHi    = document.getElementById('hi');
+const hudLives = document.getElementById('lives');
+const msgEl    = document.getElementById('msg');
+function pad(n) { return String(n).padStart(5, '0'); }
+function updateHUD() {
+  hudScore.textContent = `1UP  ${pad(score)}`;
+  hudHi.textContent    = `HIGH ${pad(hi)}`;
+  hudLives.textContent = `BOMB ${lives}`;
+}
+function showMsg(t) { msgEl.textContent = t; }
+function hideMsg()  { msgEl.textContent = ''; }
+
+// ============ 敵編隊パターン ============
+// 1編隊 = 同一レーンに複数機が縦横に並ぶ
+const FORMATIONS = [
+  { lane: 'g', count: 3, gapX: 3.5, gapZ: 2.5, kinds: ['g1','g1','g2'] },
+  { lane: 'g', count: 4, gapX: 3.0, gapZ: 2.0, kinds: ['g2','g1','g1','g2'] },
+  { lane: 'a', count: 3, gapX: 3.5, gapZ: 2.5, kinds: ['a1','a1','a2'] },
+  { lane: 'a', count: 4, gapX: 3.0, gapZ: 2.0, kinds: ['a2','a1','a1','a2'] },
+  { lane: 'g', count: 5, gapX: 2.8, gapZ: 1.8, kinds: ['g1','g2','g1','g2','g1'] },
+  { lane: 'a', count: 5, gapX: 2.8, gapZ: 1.8, kinds: ['a1','a2','a1','a2','a1'] },
+  { lane: 'g', count: 3, gapX: 5.0, gapZ: 0,   kinds: ['g1','g1','g1'] },
+  { lane: 'a', count: 3, gapX: 5.0, gapZ: 0,   kinds: ['a1','a2','a1'] },
+];
+
+function spawnFormation() {
+  const f = FORMATIONS[Math.floor(Math.random() * FORMATIONS.length)];
+  const cx = (Math.random() - 0.5) * 10;
+  const startZ = -30 - Math.random() * 8;
+  for (let i = 0; i < f.count; i++) {
+    const kind = f.kinds[i % f.kinds.length];
+    const mesh = makeEnemyMesh(kind);
+    const x = cx + (i - (f.count - 1) / 2) * f.gapX;
+    const z = startZ + i * f.gapZ;
+    mesh.position.set(x, f.lane === 'a' ? AIR_Y : GROUND_Y + 0.3, z);
+    scene.add(mesh);
+    enemies.push({
+      mesh, kind,
+      lane: f.lane,
+      x, z,
+      baseX: x,
+      hp: f.lane === 'a' ? 2 : 2,
+      phase: Math.random() * Math.PI * 2,
+      fireT: Math.random() * 2
+    });
+  }
+}
+
+function startWave() {
+  wave++;
+  const n = Math.min(2 + Math.floor(wave / 2), 5);
+  for (let i = 0; i < n; i++) spawnFormation();
+  showMsg(`WAVE ${wave}`);
+  setTimeout(hideMsg, 1000);
+}
+
+function resetGame() {
+  clearAll();
+  score = 0; lives = 3; wave = 0;
+  player.x = 0; player.lane = 0; player.y = GROUND_Y;
+  player.alive = true; player.invuln = 2; player.switching = false;
+  player.misCount = 0; player.fireCd = 0;
+  player.mesh.visible = true;
+  player.mesh.position.set(0, GROUND_Y, PLAYER_Z);
+  updateHUD();
+  state = 'play';
+  startWave();
+}
+
+function clearAll() {
+  for (const b of bullets) scene.remove(b.mesh);
+  for (const m of missiles) scene.remove(m.mesh);
+  for (const e of enemies) scene.remove(e.mesh);
+  for (const x of explosions) scene.remove(x.mesh);
+  for (const eb of enemyBullets) scene.remove(eb.mesh);
+  bullets = []; missiles = []; enemies = []; explosions = []; enemyBullets = [];
+}
+
+// ============ 攻撃 ============
+function fireGround() {
+  if (player.fireCd > 0) return;
+  player.fireCd = GROUND_FIRE_CD;
+  const m = makeBulletMesh(0x66ffff);
+  m.position.set(player.mesh.position.x, GROUND_Y + 1.4, PLAYER_Z - 2);
+  scene.add(m);
+  bullets.push({ mesh: m, vz: -BULLET_SPEED });
+}
+
+function fireMissile() {
+  if (player.misCount >= MAX_MIS) return;
+  const m = makeMissileMesh();
+  const pos = new THREE.Vector3(player.mesh.position.x, AIR_Y, PLAYER_Z - 2);
+  m.position.copy(pos);
+  scene.add(m);
+  missiles.push({ mesh: m, pos: pos.clone(), angle: Math.PI, life: 3.0 });
+  player.misCount++;
+}
+
+// ============ 被弾・撃破 ============
+function damageEnemy(idx) {
+  const e = enemies[idx];
+  e.hp--;
+  if (e.hp <= 0) {
+    const ex = makeExplosion(true);
+    ex.position.copy(e.mesh.position);
+    scene.add(ex);
+    explosions.push({ mesh: ex, life: 0.55 });
+    scene.remove(e.mesh);
+    enemies.splice(idx, 1);
+    const pts = e.lane === 'a' ? 300 : 150;
+    score += pts;
+    if (score > hi) hi = score;
+    updateHUD();
+  } else {
+    e.mesh.scale.setScalar(1.3);
+    setTimeout(() => e.mesh.scale.setScalar(1), 70);
+    score += 20;
+    updateHUD();
+  }
+}
+
+function hitPlayer() {
+  lives--;
+  updateHUD();
+  const ex = makeExplosion(true);
+  ex.position.set(player.mesh.position.x, player.mesh.position.y + 1, player.mesh.position.z);
+  scene.add(ex);
+  explosions.push({ mesh: ex, life: 0.7 });
+  player.mesh.visible = false;
+  player.alive = false;
+  player.misCount = 0;
+  if (lives <= 0) {
+    state = 'gameover';
+    showMsg('GAME OVER\n\nSPACE でリスタート');
+  } else {
+    player.respawnT = 1.4;
+  }
+}
+
+// ============ 更新 ============
+function update(dt) {
+  // 背景スクロール(ゼビウスの速度感)
+  bgScroll += dt * 3;
+  grid.position.z = (bgScroll % 1);
+
+  // --- 敵 ---
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    e.z += dt * (e.lane === 'a' ? 2.4 : 3.0) * (1 + wave * 0.04);
+    // 左右に揺れる
+    e.x = e.baseX + Math.sin(e.phase + e.z * 0.35) * 1.2;
+    e.mesh.position.set(e.x, e.lane === 'a' ? AIR_Y : GROUND_Y + 0.3, e.z);
+
+    if (e.mesh.userData.prop) e.mesh.userData.prop.rotation.z += dt * 20;
+
+    // 自機通過
+    if (e.z > FRONT_Z) {
+      scene.remove(e.mesh);
+      enemies.splice(i, 1);
+      continue;
+    }
+
+    // 敵砲撃(地上は前方一直線、空中は斜め下)
+    e.fireT -= dt;
+    if (e.fireT <= 0 && player.alive) {
+      e.fireT = 1.5 + Math.random() * 2.0;
+      const m = makeBulletMesh(0xff5555);
+      if (e.lane === 'g') {
+        m.position.set(e.x, GROUND_Y + 1.0, e.z - 1);
+        scene.add(m);
+        enemyBullets.push({ mesh: m, vx: 0, vz: 8 });
+      } else {
+        m.position.set(e.x, AIR_Y - 0.5, e.z - 1);
+        scene.add(m);
+        const dx = player.x - e.x;
+        const dz = PLAYER_Z - e.z;
+        const d = Math.hypot(dx, dz) || 1;
+        enemyBullets.push({
+          mesh: m,
+          vx: (dx / d) * 7,
+          vz: (dz / d) * 7
+        });
+      }
+    }
+  }
+
+  // --- 敵弾 ---
+  for (let i = enemyBullets.length - 1; i >= 0; i--) {
+    const b = enemyBullets[i];
+    b.mesh.position.x += b.vx * dt;
+    b.mesh.position.z += b.vz * dt;
+    if (b.mesh.position.z > 18 || b.mesh.position.z < -35 ||
+        Math.abs(b.mesh.position.x) > 20) {
+      scene.remove(b.mesh);
+      enemyBullets.splice(i, 1);
+      continue;
+    }
+    if (player.alive && !player.switching && player.invuln <= 0) {
+      const dx = b.mesh.position.x - player.mesh.position.x;
+      const dz = b.mesh.position.z - player.mesh.position.z;
+      const dy = b.mesh.position.y - (player.mesh.position.y + 1);
+      if (Math.abs(dx) < 1.5 && Math.abs(dz) < 1.5 && Math.abs(dy) < 1.8) {
+        scene.remove(b.mesh);
+        enemyBullets.splice(i, 1);
+        hitPlayer();
+      }
+    }
+  }
+
+  // --- 地上砲弾 ---
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.mesh.position.z += b.vz * dt;
+    if (b.mesh.position.z < KILL_Z) {
+      scene.remove(b.mesh);
+      bullets.splice(i, 1);
+      continue;
+    }
+    for (let j = enemies.length - 1; j >= 0; j--) {
+      const e = enemies[j];
+      if (e.lane !== 'g') continue;
+      if (Math.abs(b.mesh.position.x - e.x) < 1.5 &&
+          Math.abs(b.mesh.position.z - e.z) < 1.5) {
+        scene.remove(b.mesh);
+        bullets.splice(i, 1);
+        damageEnemy(j);
+        break;
+      }
+    }
+  }
+
+  // --- ミサイル(空中) ---
+  for (let i = missiles.length - 1; i >= 0; i--) {
+    const ms = missiles[i];
+    // ターゲット(最も近い空中敵)
+    let target = null, best = 1e9;
+    for (const e of enemies) {
+      if (e.lane !== 'a') continue;
+      const d = Math.hypot(e.x - ms.pos.x, e.z - ms.pos.z);
+      if (d < best) { best = d; target = e; }
+    }
+    if (target) {
+      const desired = Math.atan2(target.x - ms.pos.x, target.z - ms.pos.z);
+      let diff = desired - ms.angle;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      ms.angle += THREE.MathUtils.clamp(diff, -MISSILE_TURN * dt, MISSILE_TURN * dt);
+    }
+    ms.pos.x += Math.sin(ms.angle) * MISSILE_SPEED * dt;
+    ms.pos.z += Math.cos(ms.angle) * MISSILE_SPEED * dt;
+    ms.mesh.position.set(ms.pos.x, AIR_Y, ms.pos.z);
+    ms.mesh.rotation.y = ms.angle;
+    ms.life -= dt;
+
+    if (ms.life <= 0 || Math.abs(ms.pos.x) > 22 || ms.pos.z < KILL_Z - 5) {
+      scene.remove(ms.mesh);
+      missiles.splice(i, 1);
+      player.misCount--;
+      continue;
+    }
+    for (let j = enemies.length - 1; j >= 0; j--) {
+      const e = enemies[j];
+      if (e.lane !== 'a') continue;
+      if (Math.abs(ms.pos.x - e.x) < 1.8 && Math.abs(ms.pos.z - e.z) < 1.8) {
+        scene.remove(ms.mesh);
+        missiles.splice(i, 1);
+        player.misCount--;
+        damageEnemy(j);
+        break;
+      }
+    }
+  }
+
+  // --- 爆発 ---
+  for (let i = explosions.length - 1; i >= 0; i--) {
+    const ex = explosions[i];
+    ex.life -= dt;
+    ex.mesh.children.forEach(s => {
+      s.position.addScaledVector(s.userData.vel, dt);
+      s.rotation.x += dt * 6;
+      s.rotation.y += dt * 6;
+    });
+    if (ex.life <= 0) {
+      scene.remove(ex.mesh);
+      explosions.splice(i, 1);
+    }
+  }
+
+  // --- ウェーブ進行 ---
+  if (enemies.length === 0) {
+    wavePause -= dt;
+    if (wavePause <= 0) {
+      startWave();
+      wavePause = 2.0;
+    }
+  }
+}
+
+function updatePlayer(dt) {
+  if (!player.alive) {
+    if (state === 'play') {
+      player.respawnT -= dt;
+      if (player.respawnT <= 0) {
+        player.alive = true;
+        player.invuln = 2.0;
+        player.x = 0;
+        player.lane = 0;
+        player.y = GROUND_Y;
+        player.switching = false;
+        player.mesh.visible = true;
+        player.mesh.position.set(0, GROUND_Y, PLAYER_Z);
+      }
+    }
+    return;
+  }
+
+  // 左右移動
+  if (keys['ArrowLeft'] || keys['KeyA'])  player.x -= PLAYER_SPEED * dt;
+  if (keys['ArrowRight'] || keys['KeyD']) player.x += PLAYER_SPEED * dt;
+  player.x = THREE.MathUtils.clamp(player.x, -12, 12);
+
+  // レーン変更(高速移動、移動中は無敵)
+  const wantUp   = keys['ArrowUp']   || keys['KeyW'];
+  const wantDown = keys['ArrowDown'] || keys['KeyS'];
+  if (wantUp && player.lane === 0) {
+    player.switching = true;
+    player.y += SWITCH_SPEED * dt;
+    if (player.y >= AIR_Y) { player.y = AIR_Y; player.lane = 1; player.switching = false; }
+  } else if (wantDown && player.lane === 1) {
+    player.switching = true;
+    player.y -= SWITCH_SPEED * dt;
+    if (player.y <= GROUND_Y) { player.y = GROUND_Y; player.lane = 0; player.switching = false; }
+  } else {
+    player.switching = false;
+  }
+
+  player.mesh.position.set(player.x, player.y, PLAYER_Z);
+
+  // 傾き演出
+  const tilt = (keys['ArrowLeft'] || keys['KeyA']) ? 0.3
+           : (keys['ArrowRight'] || keys['KeyD']) ? -0.3 : 0;
+  player.mesh.rotation.z += (tilt - player.mesh.rotation.z) * 10 * dt;
+  const pitch = player.switching ? 0.4 : 0;
+  player.mesh.rotation.x += (pitch - player.mesh.rotation.x) * 10 * dt;
+
+  // 無敵時間
+  if (player.invuln > 0) {
+    player.invuln -= dt;
+    player.mesh.visible = Math.floor(performance.now() / 90) % 2 === 0;
+  } else {
+    player.mesh.visible = true;
+  }
+
+  // 攻撃入力
+  player.fireCd -= dt;
+  if (player.lane === 0 && !player.switching && keys['Space']) fireGround();
+  if (player.lane === 1 && !player.switching && (keys['KeyX'] || keys['KeyZ'] || keys['Enter'])) fireMissile();
+}
+
+// ============ メインループ ============
+let lastT = performance.now();
+function loop() {
+  requestAnimationFrame(loop);
+  const now = performance.now();
+  const dt = Math.min((now - lastT) / 1000, 0.05);
+  lastT = now;
+
+  if (state === 'title' || state === 'gameover') {
+    // タイトル回転演出
+    player.mesh.rotation.y += dt;
+    player.mesh.position.set(0, 4 + Math.sin(now / 500) * 0.4, 0);
+    if (keys['Space'] || keys['Enter']) {
+      keys['Space'] = false;
+      keys['Enter'] = false;
+      resetGame();
+    }
+  } else {
+    updatePlayer(dt);
+    update(dt);
+  }
+
+  renderer.render(scene, camera);
+}
+
+// ============ 起動 ============
+hi = 0;
+showMsg(
+  'A I R   R A I D\n\n' +
+  '← → / A D : 左右移動\n' +
+  '↑ ↓ / W S : レーン変更(地上 ⇄ 空中)\n\n' +
+  '[地上] SPACE   : 連射砲\n' +
+  '[空中] X / Z / Enter : 追尾ミサイル\n\n' +
+  'レーン変更中は無敵\n\n' +
+  'SPACE でスタート'
+);
+updateHUD();
+loop();
+</script>
+</body>
+</html>

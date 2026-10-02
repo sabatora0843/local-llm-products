@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3Dレースゲーム</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; width: 100%; height: 100%; background: #000; }
+  #hud {
+    position: fixed; top: 16px; left: 16px; z-index: 10;
+    font-family: 'Segoe UI', 'Hiragino Sans', sans-serif;
+    color: #fff; text-shadow: 0 2px 4px rgba(0,0,0,.6);
+    background: rgba(0,0,0,.35); padding: 12px 18px; border-radius: 12px;
+    backdrop-filter: blur(4px); line-height: 1.6; min-width: 220px;
+  }
+  #hud .big { font-size: 30px; font-weight: 700; }
+  #hud .lap { font-size: 18px; }
+  #hud .speed { font-size: 22px; font-weight: 600; }
+  #hud .record { font-size: 13px; opacity: .85; }
+  #startScreen {
+    position: fixed; inset: 0; z-index: 20;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.55); color: #fff;
+    font-family: 'Segoe UI', 'Hiragino Sans', sans-serif; text-align: center;
+  }
+  #startScreen h1 { font-size: 48px; margin: 0 0 24px; letter-spacing: 2px; }
+  #startScreen p { font-size: 16px; margin: 6px 0; opacity: .9; }
+  #startScreen .btn {
+    margin-top: 32px; padding: 14px 40px; font-size: 20px;
+    background: #ff4d4d; color: #fff; border: none; border-radius: 8px;
+    cursor: pointer; box-shadow: 0 4px 14px rgba(255,77,77,.5);
+    transition: transform .1s;
+  }
+  #startScreen .btn:hover { transform: scale(1.05); }
+  .keys { margin-top: 28px; font-size: 14px; opacity: .8; }
+  .keys kbd {
+    background: rgba(255,255,255,.15); padding: 2px 8px; border-radius: 4px;
+    font-family: monospace; margin: 0 2px;
+  }
+</style>
+</head>
+<body>
+<div id="hud" style="display:none">
+  <div class="big" id="time">0.00</div>
+  <div class="lap">LAP <span id="lap">1</span> / 3</div>
+  <div class="speed"><span id="speed">0</span> km/h</div>
+  <div class="record">ベスト: <span id="best">--</span> sec</div>
+</div>
+
+<div id="startScreen">
+  <h1>3D RACE</h1>
+  <p>3周走ってゴール！タイムを競おう</p>
+  <div class="btn" id="startBtn">スタート</div>
+  <div class="keys">
+    加速 <kbd>W</kbd>/<kbd>↑</kbd>　減速/後退 <kbd>S</kbd>/<kbd>↓</kbd><br>
+    左 <kbd>A</kbd>/<kbd>←</kbd>　右 <kbd>D</kbd>/<kbd>→</kbd>　ドリフト <kbd>Space</kbd>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* ============================================================
+   シーン基本設定
+============================================================ */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.Fog(0x87ceeb, 120, 420);
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 1000);
+camera.position.set(0, 12, -20);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+/* ============================================================
+   光源
+============================================================ */
+const hemi = new THREE.HemisphereLight(0xffffff, 0x6688aa, 0.9);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+sun.position.set(60, 100, 40);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -120;
+sun.shadow.camera.right = 120;
+sun.shadow.camera.top = 120;
+sun.shadow.camera.bottom = -120;
+sun.shadow.camera.far = 300;
+scene.add(sun);
+
+/* ============================================================
+   地面
+============================================================ */
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(2000, 2000),
+  new THREE.MeshStandardMaterial({ color: 0x3fae5a })
+);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+/* ============================================================
+   コース定義
+   制御点から滑らかなループを生成
+============================================================ */
+const controlPoints = [
+  new THREE.Vector3(0, 0, 60),
+  new THREE.Vector3(50, 0, 45),
+  new THREE.Vector3(70, 0, 0),
+  new THREE.Vector3(50, 0, -45),
+  new THREE.Vector3(15, 0, -30),
+  new THREE.Vector3(-15, 0, -55),
+  new THREE.Vector3(-55, 0, -45),
+  new THREE.Vector3(-70, 0, 0),
+  new THREE.Vector3(-45, 0, 40),
+  new THREE.Vector3(-15, 0, 55),
+];
+
+const trackCurve = new THREE.CatmullRomCurve3(controlPoints, true, 'catmullrom', 0.5);
+const TRACK_WIDTH = 9;
+
+// コース上のサンプル点（進行方向判定用）
+const TRACK_SAMPLES = 400;
+const samplePts = trackCurve.getSpacedPoints(TRACK_SAMPLES);
+
+// コース1周の長さ（m）を実測
+let TRACK_LENGTH = 0;
+for (let i = 0; i < samplePts.length; i++) {
+  const a = samplePts[i], b = samplePts[(i + 1) % samplePts.length];
+  TRACK_LENGTH += a.distanceTo(b);
+}
+
+/* ============================================================
+   コース面（リボン）
+============================================================ */
+function buildTrackGeometry(curve, width, samples) {
+  const positions = [];
+  const uvs = [];
+  const indices = [];
+  const up = new THREE.Vector3(0, 1, 0);
+
+  for (let i = 0; i <= samples; i++) {
+    const t = i / samples;
+    const p = curve.getPointAt(t);
+    const tan = curve.getTangentAt(t);
+    const side = new THREE.Vector3().crossVectors(up, tan).normalize();
+    const halfW = width / 2;
+    positions.push(p.x + side.x * halfW, 0.05, p.z + side.z * halfW);
+    positions.push(p.x - side.x * halfW, 0.05, p.z - side.z * halfW);
+    uvs.push(0, t * 40, 1, t * 40);
+    if (i < samples) {
+      const a = i * 2;
+      indices.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+const trackMesh = new THREE.Mesh(
+  buildTrackGeometry(trackCurve, TRACK_WIDTH, 600),
+  new THREE.MeshStandardMaterial({ color: 0x333340, roughness: 0.9 })
+);
+trackMesh.receiveShadow = true;
+scene.add(trackMesh);
+
+/* ============================================================
+   コースエッジ（白線）
+============================================================ */
+function buildEdgeLine(curve, width, samples, offset) {
+  const pts = [];
+  for (let i = 0; i <= samples; i++) {
+    const t = i / samples;
+    const p = curve.getPointAt(t);
+    const tan = curve.getTangentAt(t);
+    const side = new THREE.Vector3().crossVectors(new THREE.Vector3(0,1,0), tan).normalize();
+    pts.push(new THREE.Vector3(
+      p.x + side.x * width * offset, 0.08, p.z + side.z * width * offset
+    ));
+  }
+  return new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.LineBasicMaterial({ color: 0xffffff })
+  );
+}
+scene.add(buildEdgeLine(trackCurve, TRACK_WIDTH, 400, 0.45));
+scene.add(buildEdgeLine(trackCurve, TRACK_WIDTH, 400, -0.45));
+
+/* ============================================================
+   ゴールゲート
+============================================================ */
+function buildGoalGate() {
+  const t = 0;
+  const p = trackCurve.getPointAt(t);
+  const tan = trackCurve.getTangentAt(t);
+  const side = new THREE.Vector3().crossVectors(new THREE.Vector3(0,1,0), tan).normalize();
+  const g = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({ color: 0xff2222 });
+  const postGeo = new THREE.CylinderGeometry(0.4, 0.4, 6, 12);
+  const left = new THREE.Mesh(postGeo, mat);
+  left.position.copy(p).addScaledVector(side, TRACK_WIDTH / 2 + 0.6);
+  left.position.y = 3;
+  const right = left.clone();
+  right.position.copy(p).addScaledVector(side, -(TRACK_WIDTH / 2 + 0.6));
+  right.position.y = 3;
+  const barMat = new THREE.MeshStandardMaterial({ color: 0xffffff });
+  const bar = new THREE.Mesh(new THREE.BoxGeometry(TRACK_WIDTH + 2, 0.8, 0.4), barMat);
+  bar.position.copy(p).addScaledVector(side, 0);
+  bar.position.y = 6;
+  bar.rotation.y = Math.atan2(side.x, side.z);
+  left.castShadow = right.castShadow = true;
+  g.add(left, right, bar);
+  return g;
+}
+scene.add(buildGoalGate());
+
+/* ============================================================
+   環境オブジェクト（木々・岩）
+============================================================ */
+function randOnTrack(minD, maxD) {
+  for (let i = 0; i < 20; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const r = minD + Math.random() * (maxD - minD);
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    let minDist = Infinity;
+    for (const sp of samplePts) {
+      const d = (sp.x - x) ** 2 + (sp.z - z) ** 2;
+      if (d < minDist) minDist = d;
+    }
+    if (Math.sqrt(minDist) > minD && Math.sqrt(minDist) < maxD) return { x, z };
+  }
+  return null;
+}
+
+const treeGeo = new THREE.ConeGeometry(2, 6, 8);
+const trunkGeo = new THREE.CylinderGeometry(0.4, 0.5, 2, 6);
+const treeMat = new THREE.MeshStandardMaterial({ color: 0x2d8a3e });
+const trunkMat = new THREE.MeshStandardMaterial({ color: 0x6b4226 });
+const rockGeo = new THREE.DodecahedronGeometry(1.5, 0);
+const rockMat = new THREE.MeshStandardMaterial({ color: 0x888899, flatShading: true });
+
+for (let i = 0; i < 40; i++) {
+  const pos = randOnTrack(18, 90);
+  if (!pos) continue;
+  const tree = new THREE.Group();
+  const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+  trunk.position.y = 1;
+  const crown = new THREE.Mesh(treeGeo, treeMat);
+  crown.position.y = 5;
+  tree.add(trunk, crown);
+  tree.position.set(pos.x, 0, pos.z);
+  tree.rotation.y = Math.random() * Math.PI;
+  const s = 0.8 + Math.random() * 0.8;
+  tree.scale.setScalar(s);
+  tree.traverse(o => { o.castShadow = true; });
+  scene.add(tree);
+}
+for (let i = 0; i < 25; i++) {
+  const pos = randOnTrack(20, 85);
+  if (!pos) continue;
+  const rock = new THREE.Mesh(rockGeo, rockMat);
+  rock.position.set(pos.x, 0.6, pos.z);
+  rock.rotation.set(Math.random(), Math.random(), Math.random());
+  rock.scale.setScalar(0.6 + Math.random() * 1.2);
+  rock.castShadow = true;
+  scene.add(rock);
+}
+
+/* ============================================================
+   自車
+============================================================ */
+function buildCar(color) {
+  const g = new THREE.Group();
+  const bodyMat = new THREE.MeshStandardMaterial({ color, metalness: 0.5, roughness: 0.3 });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.8, 3.4), bodyMat);
+  body.position.y = 0.7;
+  const cabin = new THREE.Mesh(
+    new THREE.BoxGeometry(1.5, 0.6, 1.6),
+    new THREE.MeshStandardMaterial({ color: 0x222833, metalness: 0.3, roughness: 0.4 })
+  );
+  cabin.position.set(0, 1.3, -0.2);
+  const wheelMat = new THREE.MeshStandardMaterial({ color: 0x111111 });
+  const wheelPos = [
+    [0.9, 0.42, 1.1], [-0.9, 0.42, 1.1],
+    [0.9, 0.42, -1.1], [-0.9, 0.42, -1.1]
+  ];
+  const wheels = [];
+  for (const [x, y, z] of wheelPos) {
+    // 各ホイールに独立したgeometryを持たせ、共有transformの干渉を避ける
+    const wg = new THREE.CylinderGeometry(0.42, 0.42, 0.35, 16);
+    wg.rotateZ(Math.PI / 2);
+    const w = new THREE.Mesh(wg, wheelMat);
+    w.position.set(x, y, z);
+    w.castShadow = true;
+    wheels.push(w);
+    g.add(w);
+  }
+  body.castShadow = cabin.castShadow = true;
+  g.add(body, cabin);
+  g.userData.wheels = wheels;
+  return g;
+}
+
+const playerCar = buildCar(0xff2222);
+scene.add(playerCar);
+
+/* ============================================================
+   AI ライバルカー
+============================================================ */
+const aiCars = [];
+const aiColors = [0x2266ff, 0xffaa00, 0x9933ff];
+const aiOffset = [0.35, -0.35, 0];
+aiColors.forEach((c, i) => {
+  const car = buildCar(c);
+  const t = (i + 1) * 0.04;
+  const p = trackCurve.getPointAt(t % 1);
+  car.position.copy(p);
+  scene.add(car);
+  aiCars.push({ mesh: car, t: t % 1, speed: 14 + Math.random() * 6, offset: aiOffset[i] }); // m/s
+});
+
+/* ============================================================
+   入力
+============================================================ */
+const keys = {};
+addEventListener('keydown', e => { keys[e.code] = true; if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault(); });
+addEventListener('keyup', e => { keys[e.code] = false; });
+
+function axis(name) {
+  return (keys[name] ? 1 : 0);
+}
+function input() {
+  return {
+    throttle: axis('KeyW') + axis('ArrowUp'),
+    brake: axis('KeyS') + axis('ArrowDown'),
+    left: axis('KeyA') + axis('ArrowLeft'),
+    right: axis('KeyD') + axis('ArrowRight'),
+    drift: keys['Space'] ? 1 : 0
+  };
+}
+
+/* ============================================================
+   プレイヤー物理
+============================================================ */
+const player = {
+  pos: new THREE.Vector3(),
+  heading: 0,          // ラジアン（進行方向）
+  speed: 0,            // m/s
+  maxSpeed: 42,        // m/s
+  accel: 14,           // m/s^2
+  brake: 22,           // m/s^2
+  friction: 4.5,       // m/s^2
+  turnRate: 2.4,       // rad/s
+  onTrack: true
+};
+
+// スタート位置
+const startPos = trackCurve.getPointAt(0);
+const startTan = trackCurve.getTangentAt(0);
+player.pos.copy(startPos);
+player.pos.y = 0;
+player.heading = Math.atan2(startTan.x, startTan.z);
+playerCar.position.copy(player.pos);
+
+/* ============================================================
+   コース判定
+============================================================ */
+function nearestTrackPoint(p) {
+  let best = 0, bestD = Infinity;
+  for (let i = 0; i < samplePts.length; i++) {
+    const sp = samplePts[i];
+    const d = (sp.x - p.x) ** 2 + (sp.z - p.z) ** 2;
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return { index: best, dist: Math.sqrt(bestD) };
+}
+
+/* ============================================================
+   進行（ラップ）管理
+============================================================ */
+const TOTAL_LAPS = 3;
+const state = {
+  running: false,
+  lap: 1,
+  lapStartTime: 0,
+  raceStartTime: 0,
+  lastProgress: 0,      // コース上の0..1
+  progressSum: 0,
+  finished: false,
+  bestTime: null
+};
+
+function progressAlong(p) {
+  const { index } = nearestTrackPoint(p);
+  return index / samplePts.length;
+}
+
+/* ============================================================
+   ループ更新
+============================================================ */
+const clock = new THREE.Clock();
+let camPos = new THREE.Vector3();
+
+function updatePlayer(dt) {
+  const inp = input();
+  // 加速/減速（秒間量 × dt）
+  if (inp.throttle) player.speed += player.accel * dt;
+  if (inp.brake) player.speed -= (player.speed > 0 ? player.brake : player.accel * 0.6) * dt;
+  // 摩擦
+  if (!inp.throttle && !inp.brake) {
+    player.speed -= Math.sign(player.speed) * Math.min(player.friction * dt, Math.abs(player.speed));
+  }
+  // コース外では減速（指数減衰、dt補正）
+  if (!player.onTrack) player.speed *= Math.pow(0.25, dt);
+  player.speed = THREE.MathUtils.clamp(player.speed, -player.maxSpeed * 0.4, player.maxSpeed);
+
+  // 旋回（速度に比例、低速では旋回しにくい）
+  const steer = (inp.left - inp.right);
+  const speedFactor = Math.min(Math.abs(player.speed) / 12, 1);
+  let turn = steer * player.turnRate * speedFactor * Math.sign(player.speed || 1);
+  if (inp.drift) turn *= 1.5;
+  player.heading += turn * dt;
+
+  // 移動
+  player.pos.x += Math.sin(player.heading) * player.speed * dt;
+  player.pos.z += Math.cos(player.heading) * player.speed * dt;
+
+  // 車体表示
+  playerCar.position.copy(player.pos);
+  playerCar.position.y = 0;
+  playerCar.rotation.set(0, player.heading, 0);
+  // ドリフト時のスライド
+  const slide = inp.drift && Math.abs(player.speed) > 4 ? steer * 0.12 * Math.sign(player.speed) : 0;
+  playerCar.rotation.z = slide;
+  playerCar.rotation.x = -player.speed * 0.003;
+
+  // ホイール回転
+  for (const w of playerCar.userData.wheels) w.rotation.x += player.speed * 0.15 * dt;
+
+  // コース判定
+  const np = nearestTrackPoint(player.pos);
+  player.onTrack = np.dist < TRACK_WIDTH / 2 + 1.2;
+
+  // 進行量（ラップ）
+  const prog = progressAlong(player.pos);
+  let delta = prog - state.lastProgress;
+  if (delta > 0.5) delta -= 1;      // ゴールを逆方向に通過
+  if (delta < -0.5) delta += 1;
+  state.progressSum += delta;
+  state.lastProgress = prog;
+
+  // ラップ判定
+  const lapsDone = Math.floor(state.progressSum / 1);
+  if (lapsDone + 1 > state.lap && !state.finished) {
+    if (state.lap >= TOTAL_LAPS) {
+      finishRace();
+    } else {
+      state.lap++;
+      updateHUD();
+    }
+  }
+}
+
+function finishRace() {
+  state.finished = true;
+  state.running = false;
+  const total = (performance.now() - state.raceStartTime) / 1000;
+  if (state.bestTime === null || total < state.bestTime) {
+    state.bestTime = total;
+    localStorage.setItem('race_best', total);
+  }
+  showResult(total);
+}
+
+/* ============================================================
+   AI 更新
+============================================================ */
+function updateAI(dt) {
+  for (const ai of aiCars) {
+    ai.t = (ai.t + (ai.speed * dt) / TRACK_LENGTH) % 1;
+    const p = trackCurve.getPointAt(ai.t);
+    const tan = trackCurve.getTangentAt(ai.t);
+    const side = new THREE.Vector3().crossVectors(new THREE.Vector3(0,1,0), tan).normalize();
+    const target = p.clone().addScaledVector(side, TRACK_WIDTH * ai.offset);
+    ai.mesh.position.set(target.x, 0, target.z);
+    ai.mesh.rotation.set(0, Math.atan2(tan.x, tan.z), 0);
+    for (const w of ai.mesh.userData.wheels) w.rotation.x += ai.speed * 0.15 * dt;
+  }
+}
+
+/* ============================================================
+   カメラ（後方追従）
+============================================================ */
+function updateCamera(dt) {
+  const back = new THREE.Vector3(
+    -Math.sin(player.heading), 0, -Math.cos(player.heading)
+  );
+  const desired = player.pos.clone()
+    .addScaledVector(back, 11)
+    .add(new THREE.Vector3(0, 5.5, 0));
+  const k = 1 - Math.pow(0.001, dt);  // フレームレート非依存
+  camPos.lerp(desired, k);
+  camera.position.copy(camPos);
+  camera.lookAt(player.pos.x, player.pos.y + 1, player.pos.z);
+  // FOVを速度で変化（スピード感）
+  const targetFov = 60 + Math.min(Math.abs(player.speed) / player.maxSpeed, 1) * 18;
+  camera.fov += (targetFov - camera.fov) * 0.1;
+  camera.updateProjectionMatrix();
+}
+
+/* ============================================================
+   HUD
+============================================================ */
+const elTime = document.getElementById('time');
+const elLap = document.getElementById('lap');
+const elSpeed = document.getElementById('speed');
+const elBest = document.getElementById('best');
+
+const savedBest = parseFloat(localStorage.getItem('race_best'));
+if (savedBest) elBest.textContent = savedBest.toFixed(2);
+
+function updateHUD() {
+  elLap.textContent = Math.min(state.lap, TOTAL_LAPS);
+  elBest.textContent = state.bestTime ? state.bestTime.toFixed(2)
+    : (savedBest ? savedBest.toFixed(2) : '--');
+}
+updateHUD();
+
+/* ============================================================
+   リザルト
+============================================================ */
+function showResult(time) {
+  const s = document.getElementById('startScreen');
+  s.style.display = 'flex';
+  s.innerHTML = `
+    <h1>🏁 ゴール！</h1>
+    <p style="font-size:24px">タイム: <b>${time.toFixed(2)}</b> 秒</p>
+    <p>ベスト: <b>${state.bestTime.toFixed(2)}</b> 秒</p>
+    <div class="btn" id="restartBtn">もう一度</div>
+    <div class="keys">WASD / 矢印キーで操作</div>
+  `;
+  document.getElementById('restartBtn').onclick = restart;
+}
+
+function restart() {
+  state.running = true;
+  state.lap = 1;
+  state.finished = false;
+  state.lastProgress = 0;
+  state.progressSum = 0;
+  state.raceStartTime = performance.now();
+  player.pos.copy(startPos);
+  player.heading = Math.atan2(startTan.x, startTan.z);
+  player.speed = 0;
+  playerCar.position.copy(player.pos);
+  playerCar.rotation.set(0, player.heading, 0);
+  camPos.copy(player.pos).add(new THREE.Vector3(
+    -Math.sin(player.heading) * 11, 5.5, -Math.cos(player.heading) * 11));
+  // AIリセット
+  aiCars.forEach((ai, i) => { ai.t = (i + 1) * 0.04; });
+  document.getElementById('startScreen').style.display = 'none';
+  document.getElementById('hud').style.display = 'block';
+  updateHUD();
+}
+
+document.getElementById('startBtn').onclick = () => {
+  document.getElementById('startScreen').style.display = 'none';
+  document.getElementById('hud').style.display = 'block';
+  restart();
+};
+
+/* ============================================================
+   メインループ
+============================================================ */
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  if (state.running) {
+    updatePlayer(dt);
+    updateHUD();
+    // 残り時間表示
+    const elapsed = (performance.now() - state.raceStartTime) / 1000;
+    elTime.textContent = elapsed.toFixed(2);
+    elSpeed.textContent = Math.round(Math.abs(player.speed) * 3.6);
+  }
+  updateAI(dt);
+  updateCamera(dt);
+  renderer.render(scene, camera);
+}
+animate();
+
+/* ============================================================
+   リサイズ
+============================================================ */
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>

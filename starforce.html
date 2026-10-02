@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Star Force - 連射シューター</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; font-family: 'Hiragino Kaku Gothic ProN', 'Meiryo', sans-serif; }
+  #game { position: fixed; inset: 0; }
+  .overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; z-index: 10;
+    background: rgba(0, 5, 20, 0.75); color: #fff; text-align: center;
+  }
+  .overlay h1 { font-size: 42px; letter-spacing: 8px; margin-bottom: 16px;
+    background: linear-gradient(90deg, #4df, #f4f, #fd4); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .overlay p { font-size: 15px; line-height: 2; color: #9cf; margin-bottom: 24px; }
+  .overlay .key { display: inline-block; min-width: 1em; padding: 2px 8px; margin: 0 2px;
+    border: 1px solid #4df; border-radius: 4px; color: #4df; font-size: 13px; }
+  .btn {
+    padding: 12px 48px; font-size: 18px; letter-spacing: 4px; cursor: pointer;
+    color: #fff; background: transparent; border: 2px solid #4df; border-radius: 4px;
+    transition: all .2s;
+    -webkit-appearance: none; appearance: none;
+  }
+  .btn:hover { background: #4df; color: #002; }
+  #hud {
+    position: fixed; top: 12px; left: 16px; z-index: 5; color: #4df;
+    font-size: 16px; letter-spacing: 2px; pointer-events: none; user-select: none;
+  }
+  #hud div { margin-bottom: 4px; }
+  .hidden { display: none !important; }
+  .author { margin-top: 24px; font-size: 12px; letter-spacing: 2px; color: #678; }
+
+  /* 診断用: コンソールでエラーが見えるように */
+  #diag { position: fixed; bottom: 8px; left: 8px; z-index: 99; color: #f55;
+    font: 12px monospace; white-space: pre-wrap; max-width: 60vw; }
+</style>
+</head>
+<body>
+<div id="game"></div>
+
+<div id="hud" class="hidden">
+  <div>SCORE <span id="score">0</span></div>
+  <div>HIGH <span id="high">0</span></div>
+  <div id="lives"></div>
+</div>
+
+<div id="diag"></div>
+<div id="startScreen" class="overlay">
+  <h1>STAR FORCE</h1>
+  <p>
+    敵を撃墜せよ。連射で空を制圧。<br>
+    <span class="key">W</span><span class="key">A</span><span class="key">S</span><span class="key">D</span> / 矢印キー : 移動<br>
+    <span class="key">SPACE</span> : 射撃（長押しで連射）<br>
+    <span class="key">P</span> : 一時停止
+  </p>
+  <button class="btn" id="startBtn">START</button>
+  <div class="author">作成者: qwen/qwen3.8-27b</div>
+</div>
+
+<div id="gameOverScreen" class="overlay hidden">
+  <h1>GAME OVER</h1>
+  <p id="finalScore"></p>
+  <div style="display:flex; gap:16px; margin-top:8px;">
+    <button class="btn" id="retryBtn">RETRY</button>
+    <button class="btn" id="titleBtn">タイトルに戻る</button>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+const diag = (m) => { const d = document.getElementById('diag'); if (d) d.textContent += m + '\n'; console.error('[starforce]', m); };
+try {
+const THREE = await import('three').then(m => m).catch(async () => (await import('https://esm.sh/three')).three);
+
+
+/* ============ 基本設定 ============ */
+const WORLD_W = 20, WORLD_H = 30;        // 遊戯領域（X: -10..10, Y: -15..15）
+const PLAYER_SPEED = 14;
+const BULLET_SPEED = 45;
+const FIRE_INTERVAL = 0.09;              // 連射間隔
+const ENEMY_BASE_INTERVAL = 0.85;
+const GAME_DURATION = 120;               // 1ステージ 120秒
+
+/* ============ three.js 初期化（2D上から見下ろす配置） ============ */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x02030a);
+
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -100, 100);
+camera.position.set(0, 0, 10);          // 上から真上へ
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.getElementById('game').appendChild(renderer.domElement);
+
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h);
+  const aspect = w / h;
+  // 常に WORLD_H（縦）が画面に収まる
+  const halfH = WORLD_H / 2 + 1;
+  const halfW = halfH * aspect;
+  camera.left = -halfW; camera.right = halfW;
+  camera.top = halfH; camera.bottom = -halfH;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+/* ============ 素材 ============ */
+// 星背景（Points）
+function makeStars(count, size, color) {
+  const g = new THREE.BufferGeometry();
+  const pos = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    pos[i*3]   = (Math.random() - 0.5) * (WORLD_W + 8);
+    pos[i*3+1] = (Math.random() - 0.5) * (WORLD_H + 8);
+    pos[i*3+2] = -1 - Math.random();
+  }
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const m = new THREE.PointsMaterial({ color, size, sizeAttenuation: false,
+    transparent: true, opacity: 0.8 });
+  return new THREE.Points(g, m);
+}
+const stars1 = makeStars(160, 2, 0xffffff);
+const stars2 = makeStars(80, 3, 0x88aaff);
+scene.add(stars1, stars2);
+
+function hexToRGB(h) {
+  h = String(h).replace('#', '');
+  if (h.length === 3) h = h.split('').map(c => c + c).join('');
+  const n = parseInt(h, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+function glowCircle(color, r) {
+  const [cr, cg, cb] = hexToRGB(color);
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  g.addColorStop(0, `rgba(${cr},${cg},${cb},1)`);
+  g.addColorStop(0.5, `rgba(${cr},${cg},${cb},0.66)`);
+  g.addColorStop(1, `rgba(${cr},${cg},${cb},0)`);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 64, 64);
+  const tex = new THREE.CanvasTexture(c);
+  return new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }));
+}
+
+function shipGeometry(color) {
+  // 三角形の機体（先頭 +Y 向き）— 全サイズ 2倍
+  const s = new THREE.Shape();
+  s.moveTo(0, 0.9); s.lineTo(-0.64, -0.8); s.lineTo(0, -0.4); s.lineTo(0.64, -0.8); s.closePath();
+  const geo = new THREE.ShapeGeometry(s);
+  const mat = new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide });
+  const mesh = new THREE.Mesh(geo, mat);
+  const flame = glowCircle('#44ddff', 1); flame.scale.setScalar(1.0); flame.position.z = -0.5;
+  const grp = new THREE.Group(); grp.add(mesh, flame);
+  return grp;
+}
+
+function enemyGeometry(color) {
+  // 五角形の敵（先頭 -Y 向き、下へ降下）— 全サイズ 2倍
+  const s = new THREE.Shape();
+  const n = 5, r0 = 0.84;
+  for (let i = 0; i <= n; i++) {
+    const a = -Math.PI/2 + i * 2 * Math.PI / n;
+    const r = (i % 2 === 0) ? r0 : r0 * 0.62;
+    const x = Math.cos(a) * r, y = Math.sin(a) * r;
+    i === 0 ? s.moveTo(x, y) : s.lineTo(x, y);
+  }
+  const geo = new THREE.ShapeGeometry(s);
+  const grp = new THREE.Group();
+  grp.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color })));
+  return grp;
+}
+
+function bulletMesh(color) {
+  const m = new THREE.Mesh(
+    new THREE.BoxGeometry(0.24, 1.1, 0.2),
+    new THREE.MeshBasicMaterial({ color }));
+  const halo = glowCircle(color, 1); halo.scale.setScalar(1.0); halo.position.z = -0.1;
+  const g = new THREE.Group(); g.add(m, halo); return g;
+}
+function enemyBulletMesh() {
+  const m = new THREE.Mesh(
+    new THREE.CircleGeometry(0.44, 12),
+    new THREE.MeshBasicMaterial({ color: 0xff5533 }));
+  const halo = glowCircle('#f53', 1); halo.scale.setScalar(1.6); halo.position.z = -0.1;
+  const g = new THREE.Group(); g.add(m, halo); return g;
+}
+
+/* ============ ゲーム状態 ============ */
+let player;
+let bullets = [], enemyBullets = [], enemies = [], explosions = [];
+let score = 0, lives = 0, time = 0, fireTimer = 0, spawnTimer = 0, running = false, paused = false;
+let difficulty = 1;
+const highKey = 'starforce_high';
+const high = () => parseInt(localStorage.getItem(highKey) || '0');
+
+const hud = document.getElementById('hud');
+const scoreEl = document.getElementById('score');
+const highEl = document.getElementById('high');
+const livesEl = document.getElementById('lives');
+highEl.textContent = high();
+
+function disposeObject(o) {
+  if (!o) return;
+  o.traverse(c => {
+    if (c.geometry) c.geometry.dispose();
+    if (c.material) {
+      const mats = Array.isArray(c.material) ? c.material : [c.material];
+      for (const m of mats) {
+        if (m.map) m.map.dispose();
+        m.dispose();
+      }
+    }
+  });
+}
+function resetGame() {
+  // 旧オブジェクトを安全に破棄
+  for (const o of [...bullets, ...enemyBullets, ...enemies, ...explosions]) {
+    if (!o) continue;
+    const obj = o.mesh || o;
+    scene.remove(obj); disposeObject(obj);
+  }
+  if (player) { scene.remove(player); disposeObject(player); }
+  bullets = []; enemyBullets = []; enemies = []; explosions = [];
+  score = 0; time = 0; fireTimer = 0; spawnTimer = 0;
+  difficulty = 1;
+
+  player = shipGeometry(0x66ddff);
+  player.position.set(0, -WORLD_H/2 + 1.5, 0);
+  scene.add(player);
+
+  updateHud();
+}
+
+function updateHud() {
+  scoreEl.textContent = score;
+  highEl.textContent = Math.max(high(), score);
+  livesEl.textContent = '■'.repeat(Math.max(0, lives)) || '—';
+}
+
+/* ============ 入力 ============ */
+const keys = {};
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+  if (e.code === 'KeyP' && running) paused = !paused;
+});
+addEventListener('keyup', e => keys[e.code] = false);
+
+/* ============ シューター ============ */
+function fire() {
+  // 2本並列（スターフォース風）
+  for (const dx of [-0.3, 0.3]) {
+    const b = bulletMesh(0x88ffff);
+    b.position.set(player.position.x + dx, player.position.y + 0.5, 0.1);
+    scene.add(b); bullets.push({ mesh: b, vy: BULLET_SPEED });
+  }
+}
+
+function spawnEnemy() {
+  // タイプ: 直線降下 / 左右に揺れる / 射撃する
+  const t = Math.random();
+  let type = 0;
+  if (difficulty > 1.2 && t < 0.4) type = 1;
+  if (difficulty > 1.8 && t < 0.65) type = 2;
+  const x = (Math.random() - 0.5) * (WORLD_W - 2);
+  const e = enemyGeometry(type === 2 ? 0xff4466 : (type === 1 ? 0xffaa33 : 0xcc55ff));
+  e.position.set(x, WORLD_H/2 + 1, 0);
+  // 動きの違い: 紫=やや高速直線 / 橙=中速で左右に揺れる / 赤=低速・射撃特化（2倍速）
+  const speed = ((type === 0 ? 5.5 : type === 1 ? 4.5 : 3.5) + Math.random() * 1.5 + difficulty * 0.5) * 2;
+  scene.add(e);
+  enemies.push({
+    mesh: e, type,
+    vy: -speed,
+    baseX: x,
+    phase: Math.random() * Math.PI * 2,
+    fireCd: 0.8 + Math.random() * 1.2,
+    hp: type === 2 ? 2 : 1,
+  });
+}
+
+function boom(pos, color) {
+  const g = glowCircle(color, 1);
+  g.position.copy(pos); g.scale.setScalar(0.5);
+  scene.add(g);
+  explosions.push({ mesh: g, life: 0.35, max: 0.35, grow: 6 });
+}
+
+function hitPlayer() {
+  lives--;
+  boom(player.position, '#44ddff');
+  updateHud();
+  if (lives <= 0) { endGame(); return; }
+  // 生存時はリスポーン + 敵弾を消す（リスポーン保護）
+  player.position.set(0, -WORLD_H/2 + 1.5, 0);
+  for (const b of enemyBullets) scene.remove(b.mesh);
+  enemyBullets.length = 0;
+}
+
+function endGame() {
+  running = false;
+  const h = Math.max(high(), score);
+  localStorage.setItem(highKey, String(h));
+  document.getElementById('finalScore').textContent =
+    `SCORE ${score}   /   HIGH ${h}`;
+  document.getElementById('gameOverScreen').classList.remove('hidden');
+}
+
+/* ============ メインループ ============ */
+const clock = new THREE.Clock();
+let elapsed = 0;
+
+function tick() {
+  requestAnimationFrame(tick);
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  // 星の流れる演出（常時）
+  elapsed += dt;
+  const p1 = stars1.geometry.attributes.position;
+  for (let i = 0; i < p1.count; i++) {
+    let y = p1.getY(i) - dt * 3;
+    if (y < -WORLD_H/2 - 4) y = WORLD_H/2 + 4;
+    p1.setY(i, y);
+  }
+  p1.needsUpdate = true;
+  const p2 = stars2.geometry.attributes.position;
+  for (let i = 0; i < p2.count; i++) {
+    let y = p2.getY(i) - dt * 6;
+    if (y < -WORLD_H/2 - 4) y = WORLD_H/2 + 4;
+    p2.setY(i, y);
+  }
+  p2.needsUpdate = true;
+
+  if (!running || paused) { renderer.render(scene, camera); return; }
+
+  time += dt;
+  difficulty = 1 + time / 25;
+
+  // 120秒経過後はクリア（スコア加算してリセット的に続く: ここでは難易度のみ継続）
+  if (time > GAME_DURATION) { score += 5000; }
+
+  /* --- プレイヤー --- */
+  let dx = 0, dy = 0;
+  if (keys['KeyA'] || keys['ArrowLeft'])  dx -= 1;
+  if (keys['KeyD'] || keys['ArrowRight']) dx += 1;
+  if (keys['KeyW'] || keys['ArrowUp'])    dy += 1;
+  if (keys['KeyS'] || keys['ArrowDown'])  dy -= 1;
+  if (dx && dy) { dx *= 0.7071; dy *= 0.7071; }
+  player.position.x += dx * PLAYER_SPEED * dt;
+  player.position.y += dy * PLAYER_SPEED * dt;
+  player.position.x = Math.max(-WORLD_W/2 + 0.4, Math.min(WORLD_W/2 - 0.4, player.position.x));
+  player.position.y = Math.max(-WORLD_H/2 + 0.6, Math.min(WORLD_H/2 - 0.6, player.position.y));
+  player.rotation.z = -dx * 0.25;
+
+  // 射撃
+  fireTimer -= dt;
+  if (keys['Space'] && fireTimer <= 0) {
+    fire();
+    fireTimer = FIRE_INTERVAL / (1 + time * 0.005); // 徐々に連射速度UP
+  }
+
+  /* --- 自弾 --- */
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.mesh.position.y += b.vy * dt;
+    if (b.mesh.position.y > WORLD_H/2 + 1) {
+      scene.remove(b.mesh); bullets.splice(i, 1);
+    }
+  }
+
+  /* --- 敵 --- */
+  spawnTimer -= dt;
+  const interval = Math.max(0.25, ENEMY_BASE_INTERVAL - time * 0.006);
+  if (spawnTimer <= 0) {
+    spawnEnemy();
+    if (difficulty > 2 && Math.random() < 0.3) spawnEnemy();
+    spawnTimer = interval;
+  }
+
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    e.mesh.position.y += e.vy * dt;
+    if (e.type === 1) {
+      e.phase += dt * 3.0;
+      e.mesh.position.x = e.baseX + Math.sin(e.phase) * 4.5;
+      e.mesh.position.x = Math.max(-WORLD_W/2 + 0.5, Math.min(WORLD_W/2 - 0.5, e.mesh.position.x));
+      e.mesh.rotation.z = Math.sin(e.phase) * 0.4;
+    } else {
+      e.mesh.rotation.z = 0;
+    }
+    if (e.type === 2) {
+      e.fireCd -= dt;
+      if (e.fireCd <= 0 && e.mesh.position.y < WORLD_H/2 - 1 && e.mesh.position.y > -WORLD_H/2 + 2) {
+        const dir = new THREE.Vector2(player.position.x - e.mesh.position.x, player.position.y - e.mesh.position.y).normalize();
+        const eb = enemyBulletMesh();
+        eb.position.copy(e.mesh.position);
+        scene.add(eb);
+        enemyBullets.push({ mesh: eb, vx: dir.x * 56, vy: dir.y * 56 });
+        e.fireCd = 1.6 + Math.random();
+      }
+    }
+    if (e.mesh.position.y < -WORLD_H/2 - 1) {
+      scene.remove(e.mesh); enemies.splice(i, 1);
+    }
+  }
+
+  /* --- 敵弾 --- */
+  for (let i = enemyBullets.length - 1; i >= 0; i--) {
+    const b = enemyBullets[i];
+    b.mesh.position.x += b.vx * dt;
+    b.mesh.position.y += b.vy * dt;
+    if (b.mesh.position.y < -WORLD_H/2 - 1 ||
+        b.mesh.position.y > WORLD_H/2 + 1 ||
+        b.mesh.position.x < -WORLD_W/2 - 1 ||
+        b.mesh.position.x > WORLD_W/2 + 1) {
+      scene.remove(b.mesh); enemyBullets.splice(i, 1);
+    }
+  }
+
+  /* --- 衝突判定 --- */
+  // 自弾 × 敵
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    const er = 0.5;
+    let hit = false;
+    for (let j = bullets.length - 1; j >= 0; j--) {
+      const b = bullets[j];
+      const ddx = b.mesh.position.x - e.mesh.position.x;
+      const ddy = b.mesh.position.y - e.mesh.position.y;
+      if (ddx*ddx + ddy*ddy < er*er + 0.3) {
+        scene.remove(b.mesh); bullets.splice(j, 1);
+        e.hp--;
+        if (e.hp <= 0) {
+          hit = true;
+          score += e.type === 2 ? 300 : (e.type === 1 ? 200 : 100);
+          boom(e.mesh.position, e.type === 2 ? '#f53' : '#fa5');
+          scene.remove(e.mesh);
+          enemies.splice(i, 1);
+          updateHud();
+        }
+        break;
+      }
+    }
+  }
+  // プレイヤー × 敵
+  for (const e of enemies) {
+    const ddx = e.mesh.position.x - player.position.x;
+    const ddy = e.mesh.position.y - player.position.y;
+    if (ddx*ddx + ddy*ddy < 0.8 * 0.8) {
+      boom(e.mesh.position, '#fa5');
+      scene.remove(e.mesh);
+      enemies.splice(enemies.indexOf(e), 1);
+      hitPlayer();
+      if (!running) break;
+    }
+  }
+  // プレイヤー × 敵弾
+  for (let i = enemyBullets.length - 1; i >= 0; i--) {
+    const b = enemyBullets[i];
+    const ddx = b.mesh.position.x - player.position.x;
+    const ddy = b.mesh.position.y - player.position.y;
+    if (ddx*ddx + ddy*ddy < 0.55 * 0.55) {
+      scene.remove(b.mesh); enemyBullets.splice(i, 1);
+      hitPlayer();
+      if (!running) break;
+    }
+  }
+
+  /* --- 爆発アニメ --- */
+  for (let i = explosions.length - 1; i >= 0; i--) {
+    const x = explosions[i];
+    x.life -= dt;
+    const t = 1 - x.life / x.max;
+    x.mesh.scale.setScalar(0.5 + t * x.grow);
+    x.mesh.material.opacity = 1 - t;
+    if (x.life <= 0) {
+      scene.remove(x.mesh);
+      x.mesh.material.map && x.mesh.material.map.dispose();
+      x.mesh.material.dispose();
+      explosions.splice(i, 1);
+    }
+  }
+
+  renderer.render(scene, camera);
+}
+
+/* ============ 画面切替 ============ */
+function startGame() {
+  try {
+    resetGame();
+  } catch (err) { diag('resetGame failed: ' + (err && err.message || err)); throw err; }
+  lives = 3;
+  updateHud();
+  document.getElementById('startScreen').classList.add('hidden');
+  document.getElementById('gameOverScreen').classList.add('hidden');
+  hud.classList.remove('hidden');
+  running = true; paused = false;
+}
+function backToTitle() {
+  running = false;
+  document.getElementById('gameOverScreen').classList.add('hidden');
+  document.getElementById('startScreen').classList.remove('hidden');
+  hud.classList.add('hidden');
+}
+document.getElementById('startBtn').addEventListener('click', () => { try { startGame(); } catch (e) { diag('start: ' + e.message); } });
+document.getElementById('retryBtn').addEventListener('click', () => { try { startGame(); } catch (e) { diag('retry: ' + e.message); } });
+document.getElementById('titleBtn').addEventListener('click', backToTitle);
+addEventListener('keydown', e => {
+  if (e.code === 'Enter') {
+    if (!running && !document.getElementById('startScreen').classList.contains('hidden')) { try { startGame(); } catch (err) { diag('enter: ' + err.message); } }
+    else if (!running && !document.getElementById('gameOverScreen').classList.contains('hidden')) { try { startGame(); } catch (err) { diag('enter-retry: ' + err.message); } }
+  }
+});
+
+tick();
+} catch (err) { diag('init failed: ' + (err && err.message || err)); }
+</script>
+</body>
+</html>
